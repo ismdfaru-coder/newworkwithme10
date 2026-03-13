@@ -68,20 +68,19 @@ async function getNextCommand(
   history: { cmd: string; result: string }[],
   kpKey: string
 ): Promise<{ cmd: string; done: boolean; reason: string }> {
+  console.log("[v0] getNextCommand called, history length:", history.length);
+  
   const historyText = history
-    .map((h, i) => `Step ${i + 1}:\nCommand: ${h.cmd}\nResult:\n${h.result}`)
+    .map((h, i) => `Step ${i + 1}:\nCommand: ${h.cmd}\nResult:\n${h.result.slice(0, 1500)}`)
     .join("\n\n");
 
-  const res = await fetch("https://api.keyplex.io/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${kpKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 300,
-      messages: [
-        {
-          role: "system",
-          content: `You control a browser using agent-browser bash commands. 
+  const requestBody = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 300,
+    messages: [
+      {
+        role: "system",
+        content: `You control a browser using agent-browser bash commands. 
 Your job: decide the NEXT single command to run to complete the user's task.
 
 Available commands:
@@ -97,26 +96,48 @@ Rules:
 - Output ONLY valid JSON: { "cmd": "agent-browser ...", "done": false, "reason": "why this step" }
 - When you have the final answer from the last snapshot, output: { "cmd": "", "done": true, "reason": "answer: ..." }
 - Maximum 20 steps total`
-        },
-        {
-          role: "user",
-          content: `Task: "${task}"\n\nHistory so far:\n${historyText || "(none — this is the first step)"}\n\nWhat is the next command?`
-        }
-      ],
-    }),
-  });
+      },
+      {
+        role: "user",
+        content: `Task: "${task}"\n\nHistory so far:\n${historyText || "(none — this is the first step)"}\n\nWhat is the next command?`
+      }
+    ],
+  };
 
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Keyplex API error: ${res.status} - ${errText}`);
-  }
-
-  const data = await res.json();
-  const text = (data.choices?.[0]?.message?.content ?? "{}").replace(/```json|```/g, "").trim();
   try {
-    return JSON.parse(text);
-  } catch {
-    return { cmd: "", done: true, reason: "Failed to parse LLM response: " + text };
+    console.log("[v0] Calling Keyplex API...");
+    
+    const res = await fetch("https://api.keyplex.io/v1/chat/completions", {
+      method: "POST",
+      headers: { 
+        "Authorization": `Bearer ${kpKey}`, 
+        "Content-Type": "application/json" 
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    console.log("[v0] Keyplex response status:", res.status);
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.log("[v0] Keyplex error response:", errText);
+      throw new Error(`Keyplex API error: ${res.status} - ${errText}`);
+    }
+
+    const data = await res.json();
+    console.log("[v0] Keyplex response:", JSON.stringify(data).slice(0, 200));
+    
+    const text = (data.choices?.[0]?.message?.content ?? "{}").replace(/```json|```/g, "").trim();
+    console.log("[v0] LLM text output:", text.slice(0, 200));
+    
+    try {
+      return JSON.parse(text);
+    } catch {
+      return { cmd: "", done: true, reason: "Failed to parse LLM response: " + text };
+    }
+  } catch (err) {
+    console.log("[v0] getNextCommand error:", err);
+    throw err;
   }
 }
 
