@@ -75,8 +75,8 @@ async function getNextCommand(
     .join("\n\n");
 
   const requestBody = {
-    model: "claude-sonnet-4-6",
-    max_tokens: 300,
+    model: "openai/gpt-4o-mini",
+    max_tokens: 800,
     messages: [
       {
         role: "system",
