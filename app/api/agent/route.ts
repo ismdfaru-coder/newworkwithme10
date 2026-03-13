@@ -107,7 +107,7 @@ Rules:
   try {
     console.log("[v0] Calling Keyplex API...");
     
-    const res = await fetch("https://api.keyplex.io/v1/chat/completions", {
+    const res = await fetch("https://keyplex.ai/api/v1/chat/completions", {
       method: "POST",
       headers: { 
         "Authorization": `Bearer ${kpKey}`, 
