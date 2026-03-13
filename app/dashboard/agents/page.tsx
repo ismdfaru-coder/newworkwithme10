@@ -71,9 +71,9 @@ interface Artifact {
 
 interface FirecrawlSession {
   id: string
-  cdpUrl: string
+  cdpUrl?: string
   liveViewUrl: string
-  interactiveLiveViewUrl: string
+  interactiveLiveViewUrl?: string
 }
 
 interface FirecrawlResponse {
@@ -288,9 +288,11 @@ export default function AgentsPage() {
 
       eventSource.addEventListener("session", (e) => {
         const data = JSON.parse(e.data);
-        // Set browser session with liveViewUrl from FIRE-1
+        console.log("[v0] Session received:", data);
+        // Set browser session with liveViewUrl from Firecrawl
         setBrowserSession({
           id: data.sessionId,
+          cdpUrl: data.cdpUrl,
           liveViewUrl: data.liveViewUrl,
           interactiveLiveViewUrl: data.interactiveLiveViewUrl,
         });
@@ -336,15 +338,27 @@ export default function AgentsPage() {
         setIsLoading(false);
       });
 
-      eventSource.addEventListener("error", (e) => {
+      eventSource.addEventListener("error", (e: Event) => {
         eventSource.close();
-        const data = e.data ? JSON.parse(e.data) : { message: "Connection error" };
+        // Try to parse error data from the event
+        let errorMsg = "Connection error";
+        try {
+          const msgEvent = e as MessageEvent;
+          if (msgEvent.data) {
+            const data = JSON.parse(msgEvent.data);
+            errorMsg = data.message || data.error || errorMsg;
+          }
+        } catch {
+          // Ignore parse errors
+        }
+        
+        console.log("[v0] SSE error event:", errorMsg);
         
         setMessages(prev => prev.map(m => 
           m.id === assistantMessageId 
             ? { 
                 ...m, 
-                content: `Error: ${data.message}`,
+                content: `Error: ${errorMsg}`,
                 status: "error",
               }
             : m
@@ -354,9 +368,21 @@ export default function AgentsPage() {
         setIsBrowserLoading(false);
       });
 
-      // Handle connection errors
-      eventSource.onerror = () => {
+      // Handle connection errors (network/server issues)
+      eventSource.onerror = (err) => {
+        console.log("[v0] SSE connection error:", err);
         eventSource.close();
+        
+        setMessages(prev => prev.map(m => 
+          m.id === assistantMessageId 
+            ? { 
+                ...m, 
+                content: "Connection error: Failed to connect to agent API. Check console for details.",
+                status: "error",
+              }
+            : m
+        ));
+        
         setIsLoading(false);
         setIsBrowserLoading(false);
       };

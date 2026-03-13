@@ -18,12 +18,29 @@ const FC_BASE = "https://api.firecrawl.dev";
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "fc-21c577cb2e1a48d1a850e2850aceb4b4";
 
 async function fcPost(path: string, body: object, key: string) {
-  const res = await fetch(`${FC_BASE}${path}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return res.json();
+  const url = `${FC_BASE}${path}`;
+  console.log("[v0] fcPost →", url);
+  
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    
+    if (!res.ok) {
+      const errText = await res.text();
+      console.log("[v0] fcPost error:", res.status, errText);
+      throw new Error(`Firecrawl ${res.status}: ${errText}`);
+    }
+    
+    const data = await res.json();
+    console.log("[v0] fcPost result:", JSON.stringify(data).slice(0, 200));
+    return data;
+  } catch (err) {
+    console.log("[v0] fcPost fetch failed:", err);
+    throw err;
+  }
 }
 
 async function fcDelete(path: string, key: string) {
@@ -35,15 +52,18 @@ async function fcDelete(path: string, key: string) {
 
 // Ask LLM to convert a natural language task into Playwright JS steps
 async function getPlaywrightSteps(query: string, kpKey: string): Promise<string> {
-  const res = await fetch("https://api.keyplex.io/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${kpKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1500,
-      messages: [{
-        role: "system",
-        content: `You are a Playwright automation expert. Given a task, output ONLY a single JavaScript async function body (no function declaration, no imports) that uses the pre-existing "page" (Playwright Page object) to complete the task and prints the result using console.log().
+  console.log("[v0] getPlaywrightSteps called for query:", query);
+  
+  try {
+    const res = await fetch("https://api.keyplex.io/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${kpKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1500,
+        messages: [{
+          role: "system",
+          content: `You are a Playwright automation expert. Given a task, output ONLY a single JavaScript async function body (no function declaration, no imports) that uses the pre-existing "page" (Playwright Page object) to complete the task and prints the result using console.log().
 
 Rules:
 - page is already available — do NOT declare it
@@ -51,14 +71,26 @@ Rules:
 - Use page.goto(), page.fill(), page.click(), page.waitForSelector(), page.textContent() etc.
 - End with console.log() of the key result found
 - No markdown, no explanation, just the JS code`
-      }, {
-        role: "user",
-        content: `Task: "${query}"\n\nOutput ONLY the Playwright JS code body.`
-      }]
-    }),
-  });
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? "";
+        }, {
+          role: "user",
+          content: `Task: "${query}"\n\nOutput ONLY the Playwright JS code body.`
+        }]
+      }),
+    });
+    
+    if (!res.ok) {
+      const errText = await res.text();
+      console.log("[v0] Keyplex error:", res.status, errText);
+      throw new Error(`Keyplex ${res.status}: ${errText}`);
+    }
+    
+    const data = await res.json();
+    console.log("[v0] Keyplex response:", JSON.stringify(data).slice(0, 300));
+    return data.choices?.[0]?.message?.content ?? "";
+  } catch (err) {
+    console.log("[v0] getPlaywrightSteps failed:", err);
+    throw err;
+  }
 }
 
 async function summarise(rawOutput: string, query: string, kpKey: string): Promise<string> {
