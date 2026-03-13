@@ -9,19 +9,30 @@ const FC_BASE = "https://api.firecrawl.dev";
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "fc-21c577cb2e1a48d1a850e2850aceb4b4";
 
 async function createSession(fcKey: string) {
+  console.log("[v0] createSession called with key:", fcKey ? fcKey.slice(0, 10) + "..." : "NONE");
+  
   const res = await fetch(`${FC_BASE}/v2/browser`, {
     method: "POST",
     headers: { Authorization: `Bearer ${fcKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ ttl: 300, activityTtl: 120 }),
   });
+  
+  console.log("[v0] createSession response status:", res.status);
+  
   if (!res.ok) {
     const errText = await res.text();
+    console.log("[v0] createSession error:", errText);
     throw new Error(`Failed to create session: ${res.status} - ${errText}`);
   }
-  return res.json();
+  
+  const data = await res.json();
+  console.log("[v0] createSession success:", data.id, data.liveViewUrl?.slice(0, 50));
+  return data;
 }
 
 async function execCommand(sessionId: string, command: string, fcKey: string) {
+  console.log("[v0] execCommand:", command.slice(0, 80));
+  
   const res = await fetch(`${FC_BASE}/v2/browser/${sessionId}/execute`, {
     method: "POST",
     headers: { Authorization: `Bearer ${fcKey}`, "Content-Type": "application/json" },
@@ -30,11 +41,18 @@ async function execCommand(sessionId: string, command: string, fcKey: string) {
       language: "bash",   // THIS is the key — bash, not node
     }),
   });
+  
+  console.log("[v0] execCommand response status:", res.status);
+  
   if (!res.ok) {
     const errText = await res.text();
+    console.log("[v0] execCommand error:", errText);
     throw new Error(`Execute failed: ${res.status} - ${errText}`);
   }
-  return res.json();
+  
+  const data = await res.json();
+  console.log("[v0] execCommand result:", JSON.stringify(data).slice(0, 200));
+  return data;
 }
 
 async function deleteSession(sessionId: string, fcKey: string) {
@@ -103,9 +121,15 @@ Rules:
 }
 
 export async function GET(req: Request) {
+  console.log("[v0] GET /api/agent called");
+  
   const { searchParams } = new URL(req.url);
   const query = searchParams.get("query") ?? "";
   const kpKey = searchParams.get("keyplex_key") ?? process.env.KEYPLEX_API_KEY ?? "";
+
+  console.log("[v0] Query:", query.slice(0, 50));
+  console.log("[v0] Keyplex key present:", !!kpKey);
+  console.log("[v0] Firecrawl key present:", !!FIRECRAWL_API_KEY);
 
   if (!query) {
     return new Response(JSON.stringify({ error: "Missing query" }), { status: 400 });
