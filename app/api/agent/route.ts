@@ -1,113 +1,105 @@
 // app/api/agent/route.ts
-// CORRECT approach confirmed from Firecrawl docs:
-// 
-// IMPORTANT: The CLI commands like `agent-browser task "..."` or `firecrawl browser "open ..."` 
-// are LOCAL CLI COMMANDS — they do NOT work via the REST API /execute endpoint!
-//
-// The /v2/browser/{id}/execute endpoint expects REAL PLAYWRIGHT CODE:
-//   - language: "node" → await page.goto(), await page.click(), etc.
-//   - language: "python" → await page.goto(), await page.click(), etc.
-//
-// Strategy: Use an LLM (Keyplex/Claude) to convert natural language → Playwright JS code,
-// then execute that code in the browser session.
+// CORRECT implementation — matches exactly what Firecrawl playground does:
+// iterative agent-browser bash commands, each snapshot feeds next decision
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const FC_BASE = "https://api.firecrawl.dev";
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "fc-21c577cb2e1a48d1a850e2850aceb4b4";
 
-async function fcPost(path: string, body: object, key: string) {
-  const url = `${FC_BASE}${path}`;
-  console.log("[v0] fcPost →", url);
-  
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    
-    if (!res.ok) {
-      const errText = await res.text();
-      console.log("[v0] fcPost error:", res.status, errText);
-      throw new Error(`Firecrawl ${res.status}: ${errText}`);
-    }
-    
-    const data = await res.json();
-    console.log("[v0] fcPost result:", JSON.stringify(data).slice(0, 200));
-    return data;
-  } catch (err) {
-    console.log("[v0] fcPost fetch failed:", err);
-    throw err;
+async function createSession(fcKey: string) {
+  const res = await fetch(`${FC_BASE}/v2/browser`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${fcKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ ttl: 300, activityTtl: 120 }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Failed to create session: ${res.status} - ${errText}`);
   }
+  return res.json();
 }
 
-async function fcDelete(path: string, key: string) {
-  await fetch(`${FC_BASE}${path}`, {
+async function execCommand(sessionId: string, command: string, fcKey: string) {
+  const res = await fetch(`${FC_BASE}/v2/browser/${sessionId}/execute`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${fcKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code: command,      // e.g. "agent-browser open https://..."
+      language: "bash",   // THIS is the key — bash, not node
+    }),
+  });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Execute failed: ${res.status} - ${errText}`);
+  }
+  return res.json();
+}
+
+async function deleteSession(sessionId: string, fcKey: string) {
+  await fetch(`${FC_BASE}/v2/browser/${sessionId}`, {
     method: "DELETE",
-    headers: { Authorization: `Bearer ${key}` },
+    headers: { Authorization: `Bearer ${fcKey}` },
   });
 }
 
-// Ask LLM to convert a natural language task into Playwright JS steps
-async function getPlaywrightSteps(query: string, kpKey: string): Promise<string> {
-  console.log("[v0] getPlaywrightSteps called for query:", query);
-  
-  try {
-    const res = await fetch("https://api.keyplex.io/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${kpKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1500,
-        messages: [{
-          role: "system",
-          content: `You are a Playwright automation expert. Given a task, output ONLY a single JavaScript async function body (no function declaration, no imports) that uses the pre-existing "page" (Playwright Page object) to complete the task and prints the result using console.log().
+// Ask Keyplex what the NEXT single command should be, given the current snapshot
+async function getNextCommand(
+  task: string,
+  history: { cmd: string; result: string }[],
+  kpKey: string
+): Promise<{ cmd: string; done: boolean; reason: string }> {
+  const historyText = history
+    .map((h, i) => `Step ${i + 1}:\nCommand: ${h.cmd}\nResult:\n${h.result}`)
+    .join("\n\n");
 
-Rules:
-- page is already available — do NOT declare it
-- Use await for all async calls
-- Use page.goto(), page.fill(), page.click(), page.waitForSelector(), page.textContent() etc.
-- End with console.log() of the key result found
-- No markdown, no explanation, just the JS code`
-        }, {
-          role: "user",
-          content: `Task: "${query}"\n\nOutput ONLY the Playwright JS code body.`
-        }]
-      }),
-    });
-    
-    if (!res.ok) {
-      const errText = await res.text();
-      console.log("[v0] Keyplex error:", res.status, errText);
-      throw new Error(`Keyplex ${res.status}: ${errText}`);
-    }
-    
-    const data = await res.json();
-    console.log("[v0] Keyplex response:", JSON.stringify(data).slice(0, 300));
-    return data.choices?.[0]?.message?.content ?? "";
-  } catch (err) {
-    console.log("[v0] getPlaywrightSteps failed:", err);
-    throw err;
-  }
-}
-
-async function summarise(rawOutput: string, query: string, kpKey: string): Promise<string> {
   const res = await fetch("https://api.keyplex.io/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${kpKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
-      max_tokens: 600,
-      messages: [{
-        role: "user",
-        content: `User asked: "${query}"\n\nBrowser output:\n${rawOutput}\n\nGive a clean, direct answer.`
-      }]
+      model: "claude-sonnet-4-6",
+      max_tokens: 300,
+      messages: [
+        {
+          role: "system",
+          content: `You control a browser using agent-browser bash commands. 
+Your job: decide the NEXT single command to run to complete the user's task.
+
+Available commands:
+- agent-browser open <URL>
+- agent-browser snapshot -i        (reads page elements as refs like [ref=e1], [ref=e2])
+- agent-browser fill @REF "value"  (type into input — use ref from latest snapshot)
+- agent-browser click @REF         (click element — use ref from latest snapshot)
+
+Rules:
+- After EVERY open or click, always run snapshot -i next to read updated page state
+- ONLY use @refs that appeared in the LATEST snapshot result
+- For Google Flights: open it -> snapshot -> fill origin -> snapshot -> click airport suggestion -> fill dest -> snapshot -> click suggestion -> click date field -> snapshot -> click departure date -> click return date -> click Done -> snapshot -> click Search -> snapshot
+- Output ONLY valid JSON: { "cmd": "agent-browser ...", "done": false, "reason": "why this step" }
+- When you have the final answer from the last snapshot, output: { "cmd": "", "done": true, "reason": "answer: ..." }
+- Maximum 20 steps total`
+        },
+        {
+          role: "user",
+          content: `Task: "${task}"\n\nHistory so far:\n${historyText || "(none — this is the first step)"}\n\nWhat is the next command?`
+        }
+      ],
     }),
   });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Keyplex API error: ${res.status} - ${errText}`);
+  }
+
   const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? rawOutput;
+  const text = (data.choices?.[0]?.message?.content ?? "{}").replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { cmd: "", done: true, reason: "Failed to parse LLM response: " + text };
+  }
 }
 
 export async function GET(req: Request) {
@@ -129,95 +121,103 @@ export async function GET(req: Request) {
       let sessionId: string | null = null;
 
       try {
+        // ── 1. Create browser session ─────────────────────────────
+        send("step", { type: "info", desc: "Creating browser session..." });
 
-        // ── STEP 1: Create browser session → get liveViewUrl ─────────────
-        send("step", { type: "info", desc: "Creating Firecrawl browser session..." });
-
-        const session = await fcPost("/v2/browser", { ttl: 300, activityTtl: 120 }, FIRECRAWL_API_KEY);
-
-        if (!session.success) throw new Error(session.error ?? "Failed to create browser session");
+        const session = await createSession(FIRECRAWL_API_KEY);
+        if (!session.success) throw new Error(session.error ?? "Failed to create session");
 
         sessionId = session.id;
 
-        // Send liveViewUrl immediately — frontend renders iframe right away
+        // Send liveViewUrl immediately so iframe appears in UI
         send("session", {
           sessionId:              session.id,
-          liveViewUrl:            session.liveViewUrl,            // embed in <iframe>
-          interactiveLiveViewUrl: session.interactiveLiveViewUrl, // open tab to control manually
+          liveViewUrl:            session.liveViewUrl,
+          interactiveLiveViewUrl: session.interactiveLiveViewUrl,
         });
 
-        send("step", { type: "success", desc: `Browser session created. Live view is ready! Session: ${session.id}` });
+        send("step", { type: "success", desc: `Session created. ID: ${session.id}` });
 
-        // ── STEP 2: Generate Playwright code for this specific query ──────
-        // The /execute endpoint needs REAL Playwright code, NOT CLI commands
-        let playwrightCode = "";
+        // ── 2. Iterative command loop ──────────────────────────────
+        // Each iteration: LLM decides next command -> execute -> feed result back
+        // This is exactly how the Firecrawl playground works
 
-        if (kpKey) {
-          send("step", { type: "info", desc: "Generating Playwright automation steps for your query..." });
-          playwrightCode = await getPlaywrightSteps(query, kpKey);
-          
-          // Clean up markdown code blocks if present
-          playwrightCode = playwrightCode
-            .replace(/```(?:javascript|js|typescript|ts)?\n?/gi, "")
-            .replace(/```\n?/g, "")
-            .trim();
-          
-          send("code", { code: playwrightCode });
-          send("step", { type: "success", desc: "Playwright code generated. Executing in live browser..." });
+        const history: { cmd: string; result: string }[] = [];
+        const MAX_STEPS = 20;
+
+        if (!kpKey) {
+          // No LLM key — run a hardcoded demo for flight search
+          send("step", { type: "info", desc: "No Keyplex key provided — running demo flight search commands" });
+
+          const demoCmds = [
+            `agent-browser open https://www.google.com/travel/flights`,
+            `agent-browser snapshot -i`,
+            `agent-browser fill @e16 "Chennai"`,
+            `agent-browser snapshot -i`,
+            `agent-browser click @e5`,
+            `agent-browser fill @e18 "Manchester"`,
+            `agent-browser snapshot -i`,
+            `agent-browser click @e5`,
+            `agent-browser click @e19`,
+            `agent-browser snapshot -i`,
+            `agent-browser fill @e1 "05-20-2026"`,
+            `agent-browser fill @e2 "06-01-2026"`,
+            `agent-browser click @e336`,
+            `agent-browser snapshot -i`,
+            `agent-browser click @e21`,
+            `agent-browser snapshot -i`,
+          ];
+
+          for (let i = 0; i < demoCmds.length; i++) {
+            const cmd = demoCmds[i];
+            send("command", { index: i, total: demoCmds.length, cmd, reason: "demo step" });
+
+            const result = await execCommand(sessionId, cmd, FIRECRAWL_API_KEY);
+            const output = result.output ?? result.result ?? JSON.stringify(result);
+
+            send("result", { index: i, cmd, output: output.slice(0, 500), success: !result.error });
+            history.push({ cmd, result: output });
+
+            await new Promise(r => setTimeout(r, 800));
+          }
+
         } else {
-          // Fallback: hardcoded Google search if no LLM key
-          playwrightCode = `
-await page.goto("https://www.google.com");
-await page.waitForSelector('textarea[name="q"]');
-await page.fill('textarea[name="q"]', ${JSON.stringify(query)});
-await page.keyboard.press("Enter");
-await page.waitForSelector("#search", { timeout: 10000 });
-const results = await page.$$eval("#search .g", els =>
-  els.slice(0,3).map(e => ({
-    title: e.querySelector("h3")?.innerText ?? "",
-    url:   e.querySelector("a")?.href ?? "",
-    desc:  e.querySelector(".VwiC3b")?.innerText ?? "",
-  }))
-);
-console.log(JSON.stringify(results, null, 2));
-          `.trim();
-          send("step", { type: "info", desc: "No Keyplex key — using Google search fallback. Add keyplex_key for custom automation." });
-          send("code", { code: playwrightCode });
+          // LLM-driven loop — Keyplex decides each next command
+          send("step", { type: "info", desc: "Keyplex is driving the browser step by step..." });
+
+          for (let step = 0; step < MAX_STEPS; step++) {
+            // Ask Keyplex what to do next
+            const { cmd, done, reason } = await getNextCommand(query, history, kpKey);
+
+            if (done || !cmd) {
+              send("step", { type: "success", desc: `Completed: ${reason}` });
+              send("summary", { text: reason });
+              break;
+            }
+
+            send("command", { index: step, total: MAX_STEPS, cmd, reason });
+
+            // Execute the command in the live browser
+            const result = await execCommand(sessionId, cmd, FIRECRAWL_API_KEY);
+            const output = result.output ?? result.result ?? JSON.stringify(result);
+
+            send("result", { index: step, cmd, output: output.slice(0, 800), success: !result.error });
+
+            // Feed result back into history for next decision
+            history.push({ cmd, result: output });
+
+            await new Promise(r => setTimeout(r, 600));
+          }
         }
 
-        // ── STEP 3: Execute Playwright code in the live browser ───────────
-        // THIS IS THE KEY FIX: use language: "node" with real Playwright JS
-        send("step", { type: "executing", desc: "Executing Playwright code in the live browser..." });
-
-        const execResult = await fcPost(
-          `/v2/browser/${sessionId}/execute`,
-          {
-            code: playwrightCode,
-            language: "node",    // MUST be "node" or "python" — NOT "bash"!
-          },
-          FIRECRAWL_API_KEY
-        );
-
-        const rawOutput: string = execResult.result ?? execResult.output ?? JSON.stringify(execResult);
-
-        send("rawResult", { output: rawOutput });
-        send("step", { type: "success", desc: "Browser execution complete." });
-
-        // ── STEP 4: Summarise with LLM (optional) ─────────────────────────
-        if (kpKey) {
-          send("step", { type: "info", desc: "Summarizing the result..." });
-          const summary = await summarise(rawOutput, query, kpKey);
-          send("summary", { text: summary });
-        }
-
-        send("done", { message: "All done! See the live browser panel above." });
+        send("done", { message: "Agent finished. See live browser panel above." });
 
       } catch (err: unknown) {
         send("error", { message: err instanceof Error ? err.message : String(err) });
       } finally {
         controller.close();
         if (sessionId) {
-          setTimeout(() => fcDelete(`/v2/browser/${sessionId}`, FIRECRAWL_API_KEY), 300_000);
+          setTimeout(() => deleteSession(sessionId!, FIRECRAWL_API_KEY), 300_000);
         }
       }
     },
@@ -241,7 +241,6 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: "Missing query" }), { status: 400 });
   }
 
-  // Redirect to GET with query params for SSE streaming
   const url = new URL(req.url);
   url.searchParams.set("query", query);
   if (keyplex_key) url.searchParams.set("keyplex_key", keyplex_key);
