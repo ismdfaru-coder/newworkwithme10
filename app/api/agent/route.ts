@@ -139,8 +139,10 @@ export async function GET(req: Request) {
 
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (event: string, data: object) =>
+      const send = (event: string, data: object) => {
+        console.log("[v0] SSE send:", event, JSON.stringify(data).slice(0, 100));
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+      };
 
       let sessionId: string | null = null;
 
@@ -149,9 +151,21 @@ export async function GET(req: Request) {
         send("step", { type: "info", desc: "Creating browser session..." });
 
         const session = await createSession(FIRECRAWL_API_KEY);
-        if (!session.success) throw new Error(session.error ?? "Failed to create session");
+        console.log("[v0] Session response:", JSON.stringify(session).slice(0, 300));
+        
+        // Firecrawl returns { success: true, id: "...", liveViewUrl: "..." } on success
+        // OR { success: false, error: "..." } on failure
+        // OR just { id: "...", liveViewUrl: "..." } without success field
+        if (session.success === false) {
+          throw new Error(session.error ?? "Failed to create session");
+        }
+        
+        if (!session.id || !session.liveViewUrl) {
+          throw new Error("Invalid session response: missing id or liveViewUrl");
+        }
 
         sessionId = session.id;
+        console.log("[v0] Session ID set:", sessionId);
 
         // Send liveViewUrl immediately so iframe appears in UI
         send("session", {
@@ -239,9 +253,14 @@ export async function GET(req: Request) {
       } catch (err: unknown) {
         send("error", { message: err instanceof Error ? err.message : String(err) });
       } finally {
+        console.log("[v0] Stream closing, sessionId:", sessionId);
         controller.close();
         if (sessionId) {
-          setTimeout(() => deleteSession(sessionId!, FIRECRAWL_API_KEY), 300_000);
+          console.log("[v0] Scheduling session cleanup in 5 minutes:", sessionId);
+          setTimeout(() => {
+            console.log("[v0] Closing session:", sessionId);
+            deleteSession(sessionId!, FIRECRAWL_API_KEY);
+          }, 300_000);
         }
       }
     },
