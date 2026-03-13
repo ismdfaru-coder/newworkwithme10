@@ -9,50 +9,36 @@ const FC_BASE = "https://api.firecrawl.dev";
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "fc-21c577cb2e1a48d1a850e2850aceb4b4";
 
 async function createSession(fcKey: string) {
-  console.log("[v0] createSession called with key:", fcKey ? fcKey.slice(0, 10) + "..." : "NONE");
-  
   const res = await fetch(`${FC_BASE}/v2/browser`, {
     method: "POST",
     headers: { Authorization: `Bearer ${fcKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ ttl: 300, activityTtl: 120 }),
   });
   
-  console.log("[v0] createSession response status:", res.status);
-  
   if (!res.ok) {
     const errText = await res.text();
-    console.log("[v0] createSession error:", errText);
     throw new Error(`Failed to create session: ${res.status} - ${errText}`);
   }
   
-  const data = await res.json();
-  console.log("[v0] createSession success:", data.id, data.liveViewUrl?.slice(0, 50));
-  return data;
+  return res.json();
 }
 
 async function execCommand(sessionId: string, command: string, fcKey: string) {
-  console.log("[v0] execCommand:", command.slice(0, 80));
-  
   const res = await fetch(`${FC_BASE}/v2/browser/${sessionId}/execute`, {
     method: "POST",
     headers: { Authorization: `Bearer ${fcKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      code: command,      // e.g. "agent-browser open https://..."
-      language: "bash",   // THIS is the key — bash, not node
+      code: command,
+      language: "bash",
     }),
   });
   
-  console.log("[v0] execCommand response status:", res.status);
-  
   if (!res.ok) {
     const errText = await res.text();
-    console.log("[v0] execCommand error:", errText);
     throw new Error(`Execute failed: ${res.status} - ${errText}`);
   }
   
-  const data = await res.json();
-  console.log("[v0] execCommand result:", JSON.stringify(data).slice(0, 200));
-  return data;
+  return res.json();
 }
 
 async function deleteSession(sessionId: string, fcKey: string) {
@@ -68,10 +54,14 @@ async function getNextCommand(
   history: { cmd: string; result: string }[],
   kpKey: string
 ): Promise<{ cmd: string; done: boolean; reason: string }> {
-  console.log("[v0] getNextCommand called, history length:", history.length);
   
+  // Build history, but only show LAST snapshot in full (most relevant)
   const historyText = history
-    .map((h, i) => `Step ${i + 1}:\nCommand: ${h.cmd}\nResult:\n${h.result.slice(0, 1500)}`)
+    .map((h, i) => {
+      const isLast = i === history.length - 1;
+      const resultText = isLast ? h.result.slice(0, 4000) : h.result.slice(0, 500);
+      return `Step ${i + 1}:\nCommand: ${h.cmd}\nResult:\n${resultText}`;
+    })
     .join("\n\n");
 
   const requestBody = {
@@ -80,77 +70,66 @@ async function getNextCommand(
     messages: [
       {
         role: "system",
-        content: `You control a browser using agent-browser bash commands. 
-Your job: decide the NEXT single command to run to complete the user's task.
+        content: `You are a browser automation agent. You control a headless browser using agent-browser commands.
 
-Available commands:
-- agent-browser open <URL>
-- agent-browser snapshot -i        (reads page elements as refs like [ref=e1], [ref=e2])
-- agent-browser fill @REF "value"  (type into input — use ref from latest snapshot)
-- agent-browser click @REF         (click element — use ref from latest snapshot)
+AVAILABLE COMMANDS:
+- agent-browser open <URL>           → Opens a webpage
+- agent-browser snapshot -i          → Returns list of page elements with [ref=eNN] identifiers
+- agent-browser click @eNN           → Clicks element with that ref (e.g., @e5, @e16)
+- agent-browser fill @eNN "text"     → Types text into input field with that ref
 
-Rules:
-- After EVERY open or click, always run snapshot -i next to read updated page state
-- ONLY use @refs that appeared in the LATEST snapshot result
-- For Google Flights: open it -> snapshot -> fill origin -> snapshot -> click airport suggestion -> fill dest -> snapshot -> click suggestion -> click date field -> snapshot -> click departure date -> click return date -> click Done -> snapshot -> click Search -> snapshot
-- Output ONLY valid JSON: { "cmd": "agent-browser ...", "done": false, "reason": "why this step" }
-- When you have the final answer from the last snapshot, output: { "cmd": "", "done": true, "reason": "answer: ..." }
-- Maximum 20 steps total`
+CRITICAL RULES:
+1. After "open" or "click", ALWAYS run "snapshot -i" next to see updated page
+2. The refs like @e5, @e16 come from the LATEST snapshot output - use ONLY those exact refs
+3. Look at the snapshot result carefully - it shows elements like: button "Search" [ref=e21]
+4. To click that button, use: agent-browser click @e21
+5. NEVER use @REF literally - always use actual ref numbers from the snapshot
+
+OUTPUT FORMAT (JSON only, no markdown):
+{ "cmd": "agent-browser ...", "done": false, "reason": "brief explanation" }
+
+When task is complete:
+{ "cmd": "", "done": true, "reason": "Here is the answer: ..." }`
       },
       {
         role: "user",
-        content: `Task: "${task}"\n\nHistory so far:\n${historyText || "(none — this is the first step)"}\n\nWhat is the next command?`
+        content: `TASK: ${task}
+
+Build a browsing sequence for this task so that a headless browser can complete it using agent-browser commands.
+
+${historyText ? `HISTORY:\n${historyText}\n\nBased on the LATEST snapshot result above, what is the NEXT command? Use the exact @eNN refs shown.` : "This is the first step. Start by opening the relevant URL."}`
       }
     ],
   };
 
+  const res = await fetch("https://keyplex.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { 
+      "Authorization": `Bearer ${kpKey}`, 
+      "Content-Type": "application/json" 
+    },
+    body: JSON.stringify(requestBody),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Keyplex API error: ${res.status} - ${errText}`);
+  }
+
+  const data = await res.json();
+  const text = (data.choices?.[0]?.message?.content ?? "{}").replace(/```json|```/g, "").trim();
+  
   try {
-    console.log("[v0] Calling Keyplex API...");
-    
-    const res = await fetch("https://keyplex.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { 
-        "Authorization": `Bearer ${kpKey}`, 
-        "Content-Type": "application/json" 
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    console.log("[v0] Keyplex response status:", res.status);
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.log("[v0] Keyplex error response:", errText);
-      throw new Error(`Keyplex API error: ${res.status} - ${errText}`);
-    }
-
-    const data = await res.json();
-    console.log("[v0] Keyplex response:", JSON.stringify(data).slice(0, 200));
-    
-    const text = (data.choices?.[0]?.message?.content ?? "{}").replace(/```json|```/g, "").trim();
-    console.log("[v0] LLM text output:", text.slice(0, 200));
-    
-    try {
-      return JSON.parse(text);
-    } catch {
-      return { cmd: "", done: true, reason: "Failed to parse LLM response: " + text };
-    }
-  } catch (err) {
-    console.log("[v0] getNextCommand error:", err);
-    throw err;
+    return JSON.parse(text);
+  } catch {
+    return { cmd: "", done: true, reason: "Failed to parse LLM response: " + text };
   }
 }
 
 export async function GET(req: Request) {
-  console.log("[v0] GET /api/agent called");
-  
   const { searchParams } = new URL(req.url);
   const query = searchParams.get("query") ?? "";
   const kpKey = searchParams.get("keyplex_key") ?? process.env.KEYPLEX_API_KEY ?? "";
-
-  console.log("[v0] Query:", query.slice(0, 50));
-  console.log("[v0] Keyplex key present:", !!kpKey);
-  console.log("[v0] Firecrawl key present:", !!FIRECRAWL_API_KEY);
 
   if (!query) {
     return new Response(JSON.stringify({ error: "Missing query" }), { status: 400 });
@@ -160,10 +139,8 @@ export async function GET(req: Request) {
 
   const stream = new ReadableStream({
     async start(controller) {
-      const send = (event: string, data: object) => {
-        console.log("[v0] SSE send:", event, JSON.stringify(data).slice(0, 100));
+      const send = (event: string, data: object) =>
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
-      };
 
       let sessionId: string | null = null;
 
@@ -172,7 +149,6 @@ export async function GET(req: Request) {
         send("step", { type: "info", desc: "Creating browser session..." });
 
         const session = await createSession(FIRECRAWL_API_KEY);
-        console.log("[v0] Session response:", JSON.stringify(session).slice(0, 300));
         
         // Firecrawl returns { success: true, id: "...", liveViewUrl: "..." } on success
         // OR { success: false, error: "..." } on failure
@@ -186,7 +162,6 @@ export async function GET(req: Request) {
         }
 
         sessionId = session.id;
-        console.log("[v0] Session ID set:", sessionId);
 
         // Send liveViewUrl immediately so iframe appears in UI
         send("session", {
@@ -232,9 +207,10 @@ export async function GET(req: Request) {
             send("command", { index: i, total: demoCmds.length, cmd, reason: "demo step" });
 
             const result = await execCommand(sessionId, cmd, FIRECRAWL_API_KEY);
-            const output = result.output ?? result.result ?? JSON.stringify(result);
+            const output = result.stdout || result.output || result.result || JSON.stringify(result);
+            const hasError = result.stderr && result.stderr.includes("✗");
 
-            send("result", { index: i, cmd, output: output.slice(0, 500), success: !result.error });
+            send("result", { index: i, cmd, output: output.slice(0, 500), success: !hasError });
             history.push({ cmd, result: output });
 
             await new Promise(r => setTimeout(r, 800));
@@ -258,12 +234,15 @@ export async function GET(req: Request) {
 
             // Execute the command in the live browser
             const result = await execCommand(sessionId, cmd, FIRECRAWL_API_KEY);
-            const output = result.output ?? result.result ?? JSON.stringify(result);
+            // stdout contains the snapshot data with refs, result/output may be empty
+            const output = result.stdout || result.output || result.result || JSON.stringify(result);
+            const hasError = result.stderr && result.stderr.includes("✗");
 
-            send("result", { index: step, cmd, output: output.slice(0, 800), success: !result.error });
+            send("result", { index: step, cmd, output: output.slice(0, 800), success: !hasError });
 
-            // Feed result back into history for next decision
-            history.push({ cmd, result: output });
+            // Feed result back into history for next decision - include stderr too for error context
+            const fullResult = hasError ? `ERROR: ${result.stderr}\n${output}` : output;
+            history.push({ cmd, result: fullResult });
 
             await new Promise(r => setTimeout(r, 600));
           }
@@ -274,14 +253,9 @@ export async function GET(req: Request) {
       } catch (err: unknown) {
         send("error", { message: err instanceof Error ? err.message : String(err) });
       } finally {
-        console.log("[v0] Stream closing, sessionId:", sessionId);
         controller.close();
         if (sessionId) {
-          console.log("[v0] Scheduling session cleanup in 5 minutes:", sessionId);
-          setTimeout(() => {
-            console.log("[v0] Closing session:", sessionId);
-            deleteSession(sessionId!, FIRECRAWL_API_KEY);
-          }, 300_000);
+          setTimeout(() => deleteSession(sessionId!, FIRECRAWL_API_KEY), 300_000);
         }
       }
     },
